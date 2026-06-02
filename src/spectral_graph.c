@@ -397,7 +397,10 @@ sg_spectrum *sg_eigendecompose(const sg_matrix *M) {
             double tr = a + d;
             double det = a*d - b*c;
             double disc = sqrt(fabs(tr*tr/4.0 - det));
-            mu = tr/2.0 + disc;  /* pick closer eigenvalue */
+            /* Bug #7 fix: Pick eigenvalue of 2x2 closer to d (bottom-right) */
+            double mu1 = tr/2.0 + disc;
+            double mu2 = tr/2.0 - disc;
+            mu = (fabs(mu1 - d) < fabs(mu2 - d)) ? mu1 : mu2;
             /* Shift */
             for (uint32_t i = 0; i < n; i++) A[i*n+i] -= mu;
         }
@@ -494,18 +497,33 @@ sg_error sg_power_iteration(const sg_matrix *M, double *eigenvalue,
     for (uint32_t i = 0; i < n; i++) eigenvector[i] = (double)rand() / RAND_MAX;
     vec_normalize(eigenvector, n);
 
+    /* Bug #1 fix: Check if matrix is all-zero (no dominant eigenvector exists) */
+    bool all_zero = true;
+    for (uint32_t i = 0; i < n * n && all_zero; i++)
+        if (fabs(M->data[i]) > 1e-15) all_zero = false;
+    if (all_zero) {
+        for (uint32_t i = 0; i < n; i++) eigenvector[i] = 0;
+        *eigenvalue = 0;
+        return SG_ERR_SINGULAR;
+    }
+
     double *y = vec_alloc(n);
     for (uint32_t iter = 0; iter < max_iter; iter++) {
         mat_vec(M, eigenvector, y);
         double ev = vec_dot(eigenvector, y, n);
         vec_normalize(y, n);
-        /* Check convergence */
+        /* Check convergence BEFORE memcpy */
         double diff = 0;
         for (uint32_t i = 0; i < n; i++)
             diff += (eigenvector[i] - y[i]) * (eigenvector[i] - y[i]);
+        if (sqrt(diff) < tol) {
+            memcpy(eigenvector, y, n * sizeof(double));
+            *eigenvalue = ev;
+            free(y);
+            return SG_OK;
+        }
         memcpy(eigenvector, y, n * sizeof(double));
         *eigenvalue = ev;
-        if (sqrt(diff) < tol) { free(y); return SG_OK; }
     }
     free(y);
     return SG_ERR_NO_CONVERGE;
@@ -599,12 +617,16 @@ double sg_conductance(const sg_graph *g, const uint32_t *S, uint32_t size_S) {
     for (uint32_t i = 0; i < size_S; i++) in_S[S[i]] = true;
 
     for (uint32_t v = 0; v < g->n; v++) {
-        double deg = sg_graph_degree(g, v);
+        /* Bug #4 fix (part 2): Use weighted degree for volume computation */
+        double deg = 0;
+        for (uint32_t j = g->row_ptr[v]; j < g->row_ptr[v+1]; j++)
+            deg += g->weights ? g->weights[j] : 1.0;
         if (in_S[v]) vol_S += deg;
         else vol_comp += deg;
         if (in_S[v]) {
             for (uint32_t j = g->row_ptr[v]; j < g->row_ptr[v+1]; j++) {
-                if (!in_S[g->col_idx[j]]) cut += 1.0;
+                if (!in_S[g->col_idx[j]])
+                    cut += g->weights ? g->weights[j] : 1.0;  /* Bug #4 fix */
             }
         }
     }
@@ -678,6 +700,16 @@ sg_mixing_result *sg_compute_mixing_time(const sg_graph *g) {
     if (n < 2) {
         r->mixing_time = 0;
         r->spectral_gap = 0;
+        r->convergence_rate = 0;
+        sg_spectrum_destroy(spec);
+        return r;
+    }
+
+    /* Bug #3 fix: Check connectivity first — mixing time is meaningless
+       for disconnected graphs */
+    if (!sg_graph_is_connected(g)) {
+        r->spectral_gap = 0;
+        r->mixing_time = INFINITY;
         r->convergence_rate = 0;
         sg_spectrum_destroy(spec);
         return r;
@@ -797,7 +829,8 @@ sg_centrality_result *sg_compute_centrality(const sg_graph *g) {
             r->centrality[i] = (double)sg_graph_degree(g, i);
     }
 
-    /* Normalize so max = 1.0 */
+    /* Bug #2 fix: Normalize, but skip isolated vertices (degree=0) from
+       the denominator by using max(1, max_centrality) */
     r->max_centrality = 0;
     r->dominant_agent = 0;
     for (uint32_t i = 0; i < g->n; i++) {
@@ -807,10 +840,10 @@ sg_centrality_result *sg_compute_centrality(const sg_graph *g) {
             r->dominant_agent = i;
         }
     }
-    if (r->max_centrality > 1e-15)
-        for (uint32_t i = 0; i < g->n; i++)
-            r->centrality[i] /= r->max_centrality;
-    r->max_centrality = 1.0;
+    double norm = (r->max_centrality > 1e-15) ? r->max_centrality : 1.0;
+    for (uint32_t i = 0; i < g->n; i++)
+        r->centrality[i] /= norm;
+    r->max_centrality = (norm > 1e-15) ? 1.0 : 0.0;
 
     return r;
 }
@@ -957,10 +990,13 @@ sg_expander_result *sg_compute_expander_quality(const sg_graph *g) {
     if (A) {
         sg_spectrum *spec = sg_eigendecompose(A);
         if (spec && spec->n >= 2) {
-            /* Largest and second-largest eigenvalues of adjacency */
-            double lambda1 = spec->eigenvalues[spec->n - 1];
-            double lambda2 = spec->eigenvalues[spec->n - 2];
-            r->spectral_gap = fabs(lambda1) - fabs(lambda2);
+            /* Bug #6 fix: Use correct algebraic connectivity formulation.
+               For adjacency matrix of d-regular graph, spectral gap =
+               d - λ₂ (where eigenvalues sorted descending, λ₁=d largest).
+               This is the algebraic connectivity difference. */
+            double lambda1 = spec->eigenvalues[spec->n - 1];  /* largest */
+            double lambda2 = spec->eigenvalues[spec->n - 2];  /* second largest */
+            r->spectral_gap = lambda1 - lambda2;  /* d - λ₂ for d-regular */
         }
         sg_spectrum_destroy(spec);
         sg_matrix_destroy(A);
@@ -981,8 +1017,12 @@ sg_expander_result *sg_compute_expander_quality(const sg_graph *g) {
                     if (a > max_abs) max_abs = a;
                 }
                 r->is_ramanujan = (max_abs <= r->ramanujan_bound + 1e-10);
-                r->expander_quality = (r->ramanujan_bound > 1e-15) ?
-                    max_abs / r->ramanujan_bound : 0;
+                /* Bug #5 fix: Invert expander quality so higher = better.
+                   Ratio of Ramanujan bound to actual second eigenvalue.
+                   Quality = 1.0 when max_abs = bound (Ramanujan limit),
+                   quality > 1.0 when graph exceeds bound (better expander). */
+                r->expander_quality = (max_abs > 1e-15) ?
+                    r->ramanujan_bound / max_abs : 0;
             }
             sg_spectrum_destroy(sp);
             sg_matrix_destroy(Adj);

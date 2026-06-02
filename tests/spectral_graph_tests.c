@@ -893,6 +893,134 @@ TEST(destroy_null_results) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   19. REGRESSION TESTS FOR AUDIT BUGS
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Bug #1: Power iteration on zero matrix should return error, not fake convergence */
+TEST(regression_power_iter_zero_matrix) {
+    sg_matrix *M = sg_matrix_create(3); /* all zeros */
+    double ev = 999.0;
+    double vec[3] = {0};
+    sg_error err = sg_power_iteration(M, &ev, vec, 100, 1e-10);
+    ASSERT_EQ_INT(err, SG_ERR_SINGULAR);
+    ASSERT_EQ_DBL(ev, 0.0, EPS);  /* eigenvalue must be 0 */
+    sg_matrix_destroy(M);
+}
+
+/* Bug #2: Centrality on graph with isolated vertices should not crash */
+TEST(regression_centrality_isolated_vertices) {
+    /* 4-node graph: 0-1 connected, 2 and 3 isolated */
+    sg_graph *g = sg_graph_create(4, false);
+    sg_graph_add_edge(g, 0, 1, 1.0);
+    sg_graph_finalize(g);
+    sg_centrality_result *r = sg_compute_centrality(g);
+    ASSERT_NOT_NULL(r);
+    /* All values should be finite and in [0, 1] */
+    for (uint32_t i = 0; i < 4; i++) {
+        ASSERT_TRUE(r->centrality[i] >= 0.0);
+        ASSERT_TRUE(r->centrality[i] <= 1.0 + EPS);
+    }
+    sg_centrality_destroy(r);
+    sg_graph_destroy(g);
+}
+
+/* Bug #2: Centrality on completely isolated graph (all degree 0) */
+TEST(regression_centrality_all_isolated) {
+    sg_graph *g = sg_graph_create(3, false);
+    sg_graph_finalize(g);
+    sg_centrality_result *r = sg_compute_centrality(g);
+    ASSERT_NOT_NULL(r);
+    /* Should not crash, all centrality = 0 */
+    for (uint32_t i = 0; i < 3; i++)
+        ASSERT_EQ_DBL(r->centrality[i], 0.0, EPS);
+    sg_centrality_destroy(r);
+    sg_graph_destroy(g);
+}
+
+/* Bug #3: Mixing time for disconnected graph should be INFINITY */
+TEST(regression_mixing_disconnected) {
+    /* Two disconnected components */
+    sg_graph *g = sg_graph_create(6, false);
+    sg_graph_add_edge(g, 0, 1, 1.0);
+    sg_graph_add_edge(g, 1, 2, 1.0);
+    sg_graph_add_edge(g, 3, 4, 1.0);
+    sg_graph_add_edge(g, 4, 5, 1.0);
+    sg_graph_finalize(g);
+    ASSERT_TRUE(!sg_graph_is_connected(g));
+    sg_mixing_result *r = sg_compute_mixing_time(g);
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->mixing_time == INFINITY || r->mixing_time < 0);
+    ASSERT_EQ_DBL(r->spectral_gap, 0.0, EPS);
+    sg_mixing_destroy(r);
+    sg_graph_destroy(g);
+}
+
+/* Bug #4: Conductance should use edge weights */
+TEST(regression_conductance_weighted) {
+    sg_graph *g = sg_graph_create(4, false);
+    sg_graph_add_edge(g, 0, 1, 5.0);  /* heavy edge */
+    sg_graph_add_edge(g, 1, 2, 1.0);  /* light bridge */
+    sg_graph_add_edge(g, 2, 3, 5.0);  /* heavy edge */
+    sg_graph_add_edge(g, 3, 0, 1.0);  /* light bridge */
+    sg_graph_finalize(g);
+
+    /* S = {0,1}: cut edges are (1,2) and (0,3) with weights 1.0 + 1.0 = 2.0
+       vol(S) = 6+6=12, vol(comp) = 6+6=12, cond = 2/12 = 1/6 */
+    uint32_t S[] = {0, 1};
+    double cond = sg_conductance(g, S, 2);
+    ASSERT_TRUE(cond > 0);
+    ASSERT_TRUE(fabs(cond - 1.0/6.0) < EPS_LOOSE);
+    sg_graph_destroy(g);
+}
+
+/* Bug #5: Expander quality should be higher for better expanders */
+TEST(regression_expander_quality_semantics) {
+    /* Complete graph K_6 should have expander_quality >= 1.0 for Ramanujan */
+    sg_graph *gk = sg_graph_create(6, false);
+    sg_graph_build_complete(gk, 1.0);
+    sg_expander_result *ek = sg_compute_expander_quality(gk);
+    ASSERT_NOT_NULL(ek);
+    /* For K_6 (5-regular): Ramanujan bound = 2√4 ≈ 4.0
+       All eigenvalues of K_n besides n-1 are -1, so max_abs = 1.
+       quality = bound/max_abs = 4.0/1.0 = 4.0 >= 1.0 */
+    ASSERT_TRUE(ek->expander_quality >= 1.0 - EPS_LOOSE);
+    sg_expander_destroy(ek);
+    sg_graph_destroy(gk);
+}
+
+/* Bug #6: Spectral gap should use algebraic diff (λ₁ - λ₂), not absolute values */
+TEST(regression_expander_spectral_gap) {
+    sg_graph *g = sg_graph_create(4, false);
+    sg_graph_build_complete(g, 1.0);
+    sg_expander_result *r = sg_compute_expander_quality(g);
+    ASSERT_NOT_NULL(r);
+    /* K_4: eigenvalues of adjacency = [3, -1, -1, -1]
+       spectral_gap = 3 - (-1) = 4 (algebraic diff) */
+    ASSERT_TRUE(r->spectral_gap > 0);
+    ASSERT_EQ_DBL(r->spectral_gap, 4.0, EPS_LOOSE);
+    sg_expander_destroy(r);
+    sg_graph_destroy(g);
+}
+
+/* Bug #7: Wilkinson shift should pick closer eigenvalue */
+TEST(regression_eigendecompose_consistency) {
+    /* Build a matrix with known eigenvalues and verify QR converges correctly */
+    sg_matrix *M = sg_matrix_create(3);
+    /* Diagonal matrix with eigenvalues 1, 5, 10 */
+    M->data[0*3+0] = 1.0; M->data[0*3+1] = 0.5; M->data[0*3+2] = 0.0;
+    M->data[1*3+0] = 0.5; M->data[1*3+1] = 5.0; M->data[1*3+2] = 0.3;
+    M->data[2*3+0] = 0.0; M->data[2*3+1] = 0.3; M->data[2*3+2] = 10.0;
+    sg_spectrum *s = sg_eigendecompose(M);
+    ASSERT_NOT_NULL(s);
+    /* Eigenvalues should be close to 1, 5, 10 (allowing some QR iteration error) */
+    ASSERT_TRUE(fabs(s->eigenvalues[0] - 1.0) < 0.5);
+    ASSERT_TRUE(fabs(s->eigenvalues[1] - 5.0) < 0.5);
+    ASSERT_TRUE(fabs(s->eigenvalues[2] - 10.0) < 0.5);
+    sg_spectrum_destroy(s);
+    sg_matrix_destroy(M);
+}
+
+/* ═══════════════════════════════════════════════════════════════
    MAIN
    ═══════════════════════════════════════════════════════════════ */
 
@@ -1014,6 +1142,16 @@ int main(void) {
     RUN(single_node_graph);
     RUN(weighted_graph);
     RUN(destroy_null_results);
+
+    printf("\n── Regression Tests (Audit Bugs) ─────────────────────\n");
+    RUN(regression_power_iter_zero_matrix);
+    RUN(regression_centrality_isolated_vertices);
+    RUN(regression_centrality_all_isolated);
+    RUN(regression_mixing_disconnected);
+    RUN(regression_conductance_weighted);
+    RUN(regression_expander_quality_semantics);
+    RUN(regression_expander_spectral_gap);
+    RUN(regression_eigendecompose_consistency);
 
     printf("\n═══════════════════════════════════════════════════════════\n");
     printf("  Results: %d/%d passed, %d failed\n", g_pass, g_total, g_fail);
